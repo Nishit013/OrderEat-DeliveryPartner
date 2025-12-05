@@ -1,0 +1,7 @@
+{
+  "name": "OrderEat-DeliveryPartner",
+  "description": "Delivery Partner App for OrderEat to manage deliveries and earnings.",
+  "requestFramePermissions": [
+    "geolocation"
+  ]
+}
