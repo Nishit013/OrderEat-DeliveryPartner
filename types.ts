@@ -101,6 +101,10 @@ export interface Order {
   deliveryAddress: string;
   customerLat?: number;
   customerLng?: number;
+  deliveryCoordinates?: {
+    lat: number;
+    lng: number;
+  };
   paymentMethod: 'COD' | 'ONLINE';
   
   // Delivery Specifics
@@ -115,6 +119,14 @@ export interface Order {
   ratings?: {
       restaurant: number;
       delivery?: number;
+  };
+  billDetails?: {
+    itemTotal?: number;
+    deliveryFee: number;
+    platformFee?: number;
+    taxes?: number;
+    discountAmount?: number;
+    toPay?: number;
   };
 }
 

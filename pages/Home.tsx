@@ -1,5 +1,5 @@
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { db } from '../firebase';
 import { DeliveryPartner, Order, OrderStatus, AdminSettings, Restaurant } from '../types';
 import { MapPin, Navigation, ArrowRight, X, Check, Phone, Package, Power, ExternalLink, DollarSign } from 'lucide-react';
@@ -16,6 +16,11 @@ export const Home: React.FC<HomeProps> = ({ partner }) => {
   
   // Location
   const [myLoc, setMyLoc] = useState<{lat: number, lng: number} | null>(null);
+  
+  // Map Ref
+  const mapContainerRef = useRef<HTMLDivElement>(null);
+  const mapInstanceRef = useRef<any>(null);
+  const routingControlRef = useRef<any>(null);
 
   useEffect(() => {
     // 1. Fetch Settings
@@ -28,8 +33,20 @@ export const Home: React.FC<HomeProps> = ({ partner }) => {
 
     // 3. Location Watch
     if ('geolocation' in navigator) {
-        navigator.geolocation.getCurrentPosition(p => setMyLoc({lat: p.coords.latitude, lng: p.coords.longitude}));
-        const watch = navigator.geolocation.watchPosition(p => setMyLoc({lat: p.coords.latitude, lng: p.coords.longitude}));
+        // Increased maximumAge to 10s to allow cached positions, preventing frequent timeouts
+        const geoOptions = { enableHighAccuracy: true, timeout: 60000, maximumAge: 10000 };
+        
+        navigator.geolocation.getCurrentPosition(
+            p => setMyLoc({lat: p.coords.latitude, lng: p.coords.longitude}),
+            err => console.warn("Home geo init error", err.message),
+            geoOptions
+        );
+        
+        const watch = navigator.geolocation.watchPosition(
+            p => setMyLoc({lat: p.coords.latitude, lng: p.coords.longitude}),
+            err => console.warn("Home geo watch error", err.message),
+            geoOptions
+        );
         return () => navigator.geolocation.clearWatch(watch);
     }
   }, []);
@@ -56,7 +73,6 @@ export const Home: React.FC<HomeProps> = ({ partner }) => {
             } else {
                 setActiveOrder(null);
                 // Filter for available orders: ONLY READY_FOR_PICKUP and Unassigned
-                // Removed CONFIRMED and PREPARING statuses per request
                 const pool = list.filter(o => 
                     o.status === OrderStatus.READY_FOR_PICKUP 
                     && !o.deliveryPartnerId
@@ -84,25 +100,30 @@ export const Home: React.FC<HomeProps> = ({ partner }) => {
   const getOrderMetrics = (order: Order) => {
       const r = restaurants[order.restaurantId];
       
-      // Use coordinates if available, else fallbacks (New Delhi Area)
+      // Restaurant Location
       const rLat = r?.lat || 28.6139;
       const rLng = r?.lng || 77.2090;
       
-      // Customer coordinates or slight offset from restaurant for demo
+      // Customer Location (Strict usage of order data)
+      // Fallback only if data is completely missing (prevents crash, though logic implies data exists)
       const cLat = order.customerLat || (rLat + 0.02); 
       const cLng = order.customerLng || (rLng + 0.02);
 
       const dist = calculateDistance(rLat, rLng, cLat, cLng);
       
-      // Fee Formula: 
-      // 0-2 km: Base Fee
-      // >2 km: Base Fee + (Extra Dist * Per Km)
-      // Use safe defaults if settings are not loaded yet
+      // Use billDetails deliveryFee as payout source of truth if available, else calculate
+      if (order.billDetails?.deliveryFee) {
+          return {
+              distance: parseFloat(dist.toFixed(1)),
+              payout: order.billDetails.deliveryFee // Payout equals the Delivery Fee collected from user
+          }
+      }
+
+      // Fallback calculation for legacy orders
       const baseFee = Number(settings?.deliveryBaseFee || 40);
       const perKm = Number(settings?.deliveryPerKm || 10);
 
       let fee = baseFee;
-      
       if (dist > 2) {
           const extraDistance = dist - 2;
           fee += extraDistance * perKm;
@@ -139,7 +160,119 @@ export const Home: React.FC<HomeProps> = ({ partner }) => {
       window.open(url, '_blank');
   };
 
-  // --- RENDER ---
+  // --- LEAFLET MAP LOGIC ---
+  const currentStep = activeOrder?.status === OrderStatus.OUT_FOR_DELIVERY ? 'DROP' : 'PICKUP';
+  const restaurant = activeOrder ? restaurants[activeOrder.restaurantId] : null;
+  
+  // Restaurant Coordinates
+  const rLat = restaurant?.lat || 28.6139;
+  const rLng = restaurant?.lng || 77.2090;
+  
+  // Customer Coordinates - Checks deliveryCoordinates first (accurate), then customerLat/Lng
+  const cLat = activeOrder?.deliveryCoordinates?.lat ?? activeOrder?.customerLat ?? (rLat + 0.01);
+  const cLng = activeOrder?.deliveryCoordinates?.lng ?? activeOrder?.customerLng ?? (rLng + 0.01);
+  
+  // Partner Live Coordinates
+  const myLat = myLoc?.lat || rLat;
+  const myLng = myLoc?.lng || rLng;
+
+  // ROUTING ENDPOINTS
+  // Phase 1 (PICKUP): Origin = Partner, Destination = Restaurant
+  // Phase 2 (DROP):   Origin = Restaurant, Destination = Customer
+  
+  const originLat = currentStep === 'PICKUP' ? myLat : rLat;
+  const originLng = currentStep === 'PICKUP' ? myLng : rLng;
+  
+  const targetLat = currentStep === 'PICKUP' ? rLat : cLat;
+  const targetLng = currentStep === 'PICKUP' ? rLng : cLng;
+
+  useEffect(() => {
+      if (!activeOrder || !mapContainerRef.current || !restaurant) return;
+
+      const L = (window as any).L;
+      if (!L) return;
+
+      // Initialize Map if not exists
+      if (!mapInstanceRef.current) {
+          mapInstanceRef.current = L.map(mapContainerRef.current).setView([originLat, originLng], 13);
+          
+          L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+              attribution: '&copy; OpenStreetMap contributors'
+          }).addTo(mapInstanceRef.current);
+      }
+
+      const map = mapInstanceRef.current;
+
+      // Define Icons
+      const bikeIcon = L.icon({
+          iconUrl: 'https://cdn-icons-png.flaticon.com/512/3082/3082383.png',
+          iconSize: [32, 32],
+          iconAnchor: [16, 16],
+      });
+
+      const restaurantIcon = L.icon({
+          iconUrl: 'https://cdn-icons-png.flaticon.com/512/3448/3448606.png',
+          iconSize: [32, 32],
+          iconAnchor: [16, 32],
+      });
+
+      const customerIcon = L.icon({
+          iconUrl: 'https://cdn-icons-png.flaticon.com/512/684/684908.png',
+          iconSize: [32, 32],
+          iconAnchor: [16, 32],
+      });
+
+      // Icon Logic based on Phase
+      // PICKUP Phase: Start = Bike, End = Restaurant
+      // DROP Phase:   Start = Restaurant, End = Customer
+      const startIcon = currentStep === 'PICKUP' ? bikeIcon : restaurantIcon;
+      const endIcon = currentStep === 'PICKUP' ? restaurantIcon : customerIcon;
+
+      // Clear previous routing control
+      if (routingControlRef.current) {
+          map.removeControl(routingControlRef.current);
+          routingControlRef.current = null;
+      }
+
+      // Add Routing
+      if ((window as any).L.Routing) {
+          try {
+            routingControlRef.current = (window as any).L.Routing.control({
+                waypoints: [
+                    L.latLng(originLat, originLng),
+                    L.latLng(targetLat, targetLng)
+                ],
+                lineOptions: {
+                    styles: [{ color: currentStep === 'PICKUP' ? '#f97316' : '#16a34a', weight: 6 }]
+                },
+                createMarker: function(i: number, waypoint: any, n: number) {
+                    return L.marker(waypoint.latLng, {
+                        icon: i === 0 ? startIcon : endIcon
+                    });
+                },
+                addWaypoints: false,
+                draggableWaypoints: false,
+                fitSelectedRoutes: true,
+                show: false // Hide instructions panel
+            }).addTo(map);
+          } catch (e) {
+              console.error("Routing Error:", e);
+          }
+      }
+
+  }, [activeOrder?.id, currentStep, originLat, originLng, targetLat, targetLng, restaurant]);
+
+  // Cleanup Map on unmount or order finish
+  useEffect(() => {
+      if (!activeOrder && mapInstanceRef.current) {
+          mapInstanceRef.current.remove();
+          mapInstanceRef.current = null;
+          routingControlRef.current = null;
+      }
+  }, [activeOrder]);
+
+
+  // --- RENDER STATES ---
 
   if (!partner.isOnline) {
       return (
@@ -153,60 +286,33 @@ export const Home: React.FC<HomeProps> = ({ partner }) => {
       );
   }
 
-  // --- ACTIVE DELIVERY VIEW ---
   if (activeOrder) {
-      const restaurant = restaurants[activeOrder.restaurantId];
-      // Phase 1: To Restaurant (Pickup) -> Status is NOT OUT_FOR_DELIVERY
-      // Phase 2: To Customer (Drop) -> Status IS OUT_FOR_DELIVERY
-      const currentStep = activeOrder.status === OrderStatus.OUT_FOR_DELIVERY ? 'DROP' : 'PICKUP';
-      
-      const rLat = restaurant?.lat || 28.6139;
-      const rLng = restaurant?.lng || 77.2090;
-      const cLat = activeOrder.customerLat || 28.5355;
-      const cLng = activeOrder.customerLng || 77.3910;
-      const myLat = myLoc?.lat || rLat; // Fallback
-      const myLng = myLoc?.lng || rLng;
-
-      const targetLat = currentStep === 'PICKUP' ? rLat : cLat;
-      const targetLng = currentStep === 'PICKUP' ? rLng : cLng;
-      const originLat = currentStep === 'PICKUP' ? myLat : rLat;
-      const originLng = currentStep === 'PICKUP' ? myLng : rLng;
-
       return (
           <div className="h-full flex flex-col">
-              {/* Dynamic Map Embed */}
-              <div className="flex-1 bg-gray-100 relative group overflow-hidden">
-                  <iframe 
-                    width="100%" 
-                    height="100%" 
-                    frameBorder="0" 
-                    scrolling="no" 
-                    marginHeight={0} 
-                    marginWidth={0} 
-                    src={`https://maps.google.com/maps?q=${targetLat},${targetLng}&hl=en&z=15&output=embed`}
-                    className="w-full h-full opacity-80"
-                  ></iframe>
+              {/* Leaflet Map */}
+              <div className="flex-1 bg-gray-100 relative group overflow-hidden z-0">
+                  <div ref={mapContainerRef} className="w-full h-full" style={{ zIndex: 0 }} />
                   
-                  {/* Overlay Info */}
-                  <div className="absolute top-4 left-1/2 -translate-x-1/2 bg-white dark:bg-gray-800 px-4 py-2 rounded-full shadow-lg font-bold text-sm flex items-center gap-2 animate-bounce z-10 border border-gray-200 dark:border-gray-700">
-                      <Navigation className="w-4 h-4 text-blue-600 fill-current" />
-                      {currentStep === 'PICKUP' ? 'Go to Restaurant' : 'Go to Customer'}
+                  {/* Overlay Status */}
+                  <div className={`absolute top-4 left-1/2 -translate-x-1/2 px-4 py-2 rounded-full shadow-lg font-bold text-sm flex items-center gap-2 animate-bounce z-[400] border border-gray-200 dark:border-gray-700 whitespace-nowrap ${currentStep === 'PICKUP' ? 'bg-orange-600 text-white' : 'bg-green-600 text-white'}`}>
+                      <Navigation className="w-4 h-4 fill-current" />
+                      {currentStep === 'PICKUP' ? 'Navigating to Restaurant' : 'Navigating to Customer'}
                   </div>
 
                   <button 
                     onClick={() => openGoogleMaps(originLat, originLng, targetLat, targetLng)}
-                    className="absolute bottom-6 right-4 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-full shadow-xl z-10 flex items-center gap-2 font-bold text-sm"
+                    className="absolute bottom-6 right-4 bg-white dark:bg-gray-800 text-blue-600 hover:text-blue-700 px-4 py-2 rounded-full shadow-xl z-[400] flex items-center gap-2 font-bold text-sm border border-gray-200 dark:border-gray-700"
                   >
-                      <ExternalLink className="w-4 h-4" /> Start Navigation
+                      <ExternalLink className="w-4 h-4" /> Open Google Maps
                   </button>
               </div>
 
               {/* Action Card */}
-              <div className="bg-white dark:bg-gray-800 p-6 rounded-t-3xl shadow-[0_-5px_20px_rgba(0,0,0,0.1)] -mt-6 relative z-20">
+              <div className="bg-white dark:bg-gray-800 p-6 rounded-t-3xl shadow-[0_-5px_20px_rgba(0,0,0,0.1)] -mt-6 relative z-[500]">
                   <div className="flex justify-between items-center mb-6">
                       <div>
                           <h3 className="text-lg font-bold text-gray-800 dark:text-white">
-                              {currentStep === 'PICKUP' ? activeOrder.restaurantName : 'Customer Delivery'}
+                              {currentStep === 'PICKUP' ? activeOrder.restaurantName : 'Customer Drop-off'}
                           </h3>
                           <p className="text-sm text-gray-500 max-w-[200px] truncate">
                               {currentStep === 'PICKUP' ? restaurant?.address : activeOrder.deliveryAddress}
@@ -231,14 +337,14 @@ export const Home: React.FC<HomeProps> = ({ partner }) => {
                   {currentStep === 'PICKUP' ? (
                       <button 
                         onClick={() => updateStatus(OrderStatus.OUT_FOR_DELIVERY)}
-                        className="w-full py-4 bg-blue-600 hover:bg-blue-700 text-white font-bold text-lg rounded-xl shadow-lg shadow-blue-200 dark:shadow-blue-900/50 flex items-center justify-center gap-2"
+                        className="w-full py-4 bg-gradient-to-r from-orange-500 to-red-500 hover:from-orange-600 hover:to-red-600 text-white font-bold text-lg rounded-xl shadow-lg flex items-center justify-center gap-2"
                       >
-                          Order Picked Up <ArrowRight className="w-6 h-6" />
+                          Confirm Pickup <ArrowRight className="w-6 h-6" />
                       </button>
                   ) : (
                       <button 
                         onClick={() => updateStatus(OrderStatus.DELIVERED)}
-                        className="w-full py-4 bg-green-600 hover:bg-green-700 text-white font-bold text-lg rounded-xl shadow-lg shadow-green-200 dark:shadow-green-900/50 flex items-center justify-center gap-2"
+                        className="w-full py-4 bg-gradient-to-r from-green-600 to-teal-600 hover:from-green-700 hover:to-teal-700 text-white font-bold text-lg rounded-xl shadow-lg flex items-center justify-center gap-2"
                       >
                           Mark Delivered <Check className="w-6 h-6" />
                       </button>
@@ -248,7 +354,7 @@ export const Home: React.FC<HomeProps> = ({ partner }) => {
       );
   }
 
-  // --- NO ACTIVE ORDER: SHOW FEED ---
+  // --- NO ACTIVE ORDER ---
   return (
     <div className="p-4 space-y-4">
         {availableOrders.length === 0 ? (
@@ -300,7 +406,6 @@ export const Home: React.FC<HomeProps> = ({ partner }) => {
                                 </div>
                             </div>
 
-                            {/* Swipe Actions (Simulated with Buttons) */}
                             <div className="flex border-t border-gray-100 dark:border-gray-700">
                                 <button className="flex-1 py-4 bg-gray-50 dark:bg-gray-700/50 text-red-500 font-bold text-sm hover:bg-red-50 dark:hover:bg-red-900/20 transition flex items-center justify-center gap-2">
                                     <X className="w-5 h-5" /> Reject

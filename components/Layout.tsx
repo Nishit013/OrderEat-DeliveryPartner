@@ -18,8 +18,11 @@ export const Layout: React.FC<LayoutProps> = ({ partner, children, activeTab, on
   useEffect(() => {
     let watchId: number;
 
-    if (partner.isOnline) {
+    const startWatch = (highAccuracy: boolean) => {
         if ('geolocation' in navigator) {
+            // Clear previous watch if restarting logic
+            if (watchId) navigator.geolocation.clearWatch(watchId);
+
             watchId = navigator.geolocation.watchPosition(
                 (pos) => {
                     // Update location in Firebase
@@ -33,13 +36,27 @@ export const Layout: React.FC<LayoutProps> = ({ partner, children, activeTab, on
                 },
                 (err) => {
                     console.error(`Location error (${err.code}): ${err.message}`);
+                    // Error Code 3 is TIMEOUT. 
+                    // If we timeout on High Accuracy, try falling back to Low Accuracy.
+                    if (err.code === 3 && highAccuracy) {
+                        console.warn("High Accuracy Timed Out. Switching to Low Accuracy...");
+                        startWatch(false);
+                    }
                 },
-                // Increased timeout to 30s to prevent timeouts on mobile
-                { enableHighAccuracy: true, maximumAge: 10000, timeout: 30000 }
+                { 
+                    enableHighAccuracy: highAccuracy, 
+                    maximumAge: 10000, // Accept cached positions up to 10s old
+                    timeout: 45000     // Wait 45s before timing out
+                }
             );
         } else {
             console.error("Geolocation is not supported by this browser.");
         }
+    };
+
+    if (partner.isOnline) {
+        // Start with High Accuracy
+        startWatch(true);
     }
 
     return () => {
