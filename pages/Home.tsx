@@ -24,31 +24,60 @@ export const Home: React.FC<HomeProps> = ({ partner }) => {
 
   useEffect(() => {
     // 1. Fetch Settings
-    db.ref('adminSettings').on('value', s => s.exists() && setSettings(s.val()));
+    const settingsRef = db.ref('adminSettings');
+    const settingsListener = settingsRef.on('value', s => s.exists() && setSettings(s.val()));
     
     // 2. Fetch Restaurants (for coordinates)
-    db.ref('restaurants').on('value', s => {
+    const restRef = db.ref('restaurants');
+    const restListener = restRef.on('value', s => {
         if(s.exists()) setRestaurants(s.val());
     });
 
-    // 3. Location Watch
-    if ('geolocation' in navigator) {
-        // Increased maximumAge to 10s to allow cached positions, preventing frequent timeouts
-        const geoOptions = { enableHighAccuracy: true, timeout: 60000, maximumAge: 10000 };
-        
-        navigator.geolocation.getCurrentPosition(
-            p => setMyLoc({lat: p.coords.latitude, lng: p.coords.longitude}),
-            err => console.warn("Home geo init error", err.message),
-            geoOptions
-        );
-        
-        const watch = navigator.geolocation.watchPosition(
-            p => setMyLoc({lat: p.coords.latitude, lng: p.coords.longitude}),
-            err => console.warn("Home geo watch error", err.message),
-            geoOptions
-        );
-        return () => navigator.geolocation.clearWatch(watch);
-    }
+    // 3. Location Watch with Fallback Strategy
+    let watchId: number;
+
+    const startLocationWatch = (useHighAccuracy: boolean) => {
+        if (!('geolocation' in navigator)) {
+            console.warn("Geolocation not supported");
+            return;
+        }
+
+        // Clear existing watch if any
+        if (watchId) navigator.geolocation.clearWatch(watchId);
+
+        const options = { 
+            enableHighAccuracy: useHighAccuracy, 
+            timeout: 30000, // 30s timeout
+            maximumAge: 30000 // Accept cached positions up to 30s old
+        };
+
+        const onSuccess = (p: GeolocationPosition) => {
+            setMyLoc({ lat: p.coords.latitude, lng: p.coords.longitude });
+        };
+
+        const onError = (err: GeolocationPositionError) => {
+            console.warn(`Home Map Geo Error (${err.code}): ${err.message}`);
+            // If Timeout (3) and we were using High Accuracy, try Low Accuracy
+            if (err.code === 3 && useHighAccuracy) {
+                console.log("Home Map: High accuracy timed out, switching to low accuracy...");
+                startLocationWatch(false);
+            }
+        };
+
+        // Try to get current position immediately
+        navigator.geolocation.getCurrentPosition(onSuccess, onError, options);
+        // Start watching
+        watchId = navigator.geolocation.watchPosition(onSuccess, onError, options);
+    };
+
+    // Start with High Accuracy
+    startLocationWatch(true);
+
+    return () => {
+        settingsRef.off('value', settingsListener);
+        restRef.off('value', restListener);
+        if (watchId) navigator.geolocation.clearWatch(watchId);
+    };
   }, []);
 
   useEffect(() => {
